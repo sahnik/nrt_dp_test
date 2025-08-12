@@ -16,11 +16,13 @@ Architecture:
     
     The pipeline follows this execution order:
     1. Field Mapping: Standardize field names
-    2. Type Conversion: Convert data types with validation
-    3. Standardization: Apply business rules and defaults
-    4. Duplicate Check: Remove/mark duplicate records
-    5. Quality Validation: Validate against business rules
-    6. Dual Sinks: Write to both MongoDB and Kafka in parallel
+    2. Lookup Cache: Warm reference data cache from Kafka
+    3. Type Conversion: Convert data types with validation  
+    4. Data Enrichment: Enrich records with reference data lookups
+    5. Standardization: Apply business rules and defaults
+    6. Duplicate Check: Remove/mark duplicate records
+    7. Quality Validation: Validate against business rules
+    8. Dual Sinks: Write to both MongoDB and Kafka in parallel
 
 Usage:
     python pipeline/main.py
@@ -52,6 +54,8 @@ from task_components.data_quality.validator import (
     RangeRule,
     PatternRule
 )
+from task_components.enrichment.lookup_cache import LookupCacheTask
+from task_components.enrichment.data_enrichment import DataEnrichmentTask
 from pipeline.kafka_consumer import BatchKafkaConsumer
 from pipeline.kafka_producer import KafkaProducerAsync
 from pipeline.mongodb_sink import MongoDBSinkTask
@@ -111,11 +115,13 @@ class DataPipeline:
         
         The DAG is constructed with the following processing stages:
         1. Field Mapping: Standardizes field names (e.g., user_id → userId)
-        2. Type Conversion: Converts string data to appropriate types
-        3. Data Standardization: Applies business rules and default values
-        4. Duplicate Check: Identifies and removes duplicate records
-        5. Quality Validation: Validates records against business rules
-        6. Dual Sinks: Parallel writes to MongoDB and Kafka
+        2. Lookup Cache: Manages reference data cache from Kafka lookup topic
+        3. Type Conversion: Converts string data to appropriate types
+        4. Data Enrichment: Enriches records with reference data from cache
+        5. Data Standardization: Applies business rules and default values
+        6. Duplicate Check: Identifies and removes duplicate records
+        7. Quality Validation: Validates records against business rules
+        8. Dual Sinks: Parallel writes to MongoDB and Kafka
         
         Dependencies are configured to ensure proper execution order,
         with both sinks running in parallel after validation.
@@ -146,7 +152,15 @@ class DataPipeline:
             }
         )
         
-        # 2. Type Conversion Task: Converts string data to appropriate types with validation
+        # 2. Lookup Cache Task: Manages reference data cache from Kafka lookup topic
+        lookup_cache = LookupCacheTask(
+            name="lookup_cache",
+            refresh_strategy="startup",  # Refresh cache on pipeline startup
+            max_cache_size=1000000,      # 1M entries max
+            lookup_topic="lookup-data"   # Kafka topic with reference data
+        )
+        
+        # 3. Type Conversion Task: Converts string data to appropriate types with validation
         type_conversion = DataTypeConversionTask(
             name="type_conversion",
             conversions={
@@ -160,7 +174,48 @@ class DataPipeline:
             }
         )
         
-        # 3. Data Standardization Task: Applies business rules and adds default values
+        # 4. Data Enrichment Task: Enriches records with reference data from cache
+        data_enrichment = DataEnrichmentTask(
+            name="data_enrichment",
+            enrichment_rules=[
+                {
+                    "lookup_key": "userId",
+                    "reference_type": "customers",
+                    "target_fields": ["customer_name", "customer_type", "segment", "region"],
+                    "strategy": "append",
+                    "fallback_values": {
+                        "customer_name": "Unknown Customer",
+                        "customer_type": "Regular", 
+                        "segment": "Default"
+                    },
+                    "required": False
+                },
+                {
+                    "lookup_key": "productId", 
+                    "reference_type": "products",
+                    "target_fields": ["product_name", "category", "brand", "price"],
+                    "strategy": "conditional",  # Only add if fields are missing
+                    "fallback_values": {
+                        "product_name": "Unknown Product",
+                        "category": "General"
+                    },
+                    "required": False
+                },
+                {
+                    "lookup_key": "locationId",
+                    "reference_type": "locations", 
+                    "target_fields": ["location_name", "city", "state", "region", "timezone"],
+                    "strategy": "append",
+                    "condition": "exists:locationId",  # Only if locationId exists
+                    "required": False
+                }
+            ],
+            input_key="data",
+            output_key="data",  # Replace original data with enriched data 
+            max_lookup_failures=0.3  # Allow 30% lookup failures
+        )
+        
+        # 5. Data Standardization Task: Applies business rules and adds default values
         standardization = DataStandardizationTask(
             name="standardization",
             default_values={
@@ -169,14 +224,14 @@ class DataPipeline:
             }
         )
         
-        # 4. Duplicate Check Task: Identifies and removes duplicate records based on key fields
+        # 6. Duplicate Check Task: Identifies and removes duplicate records based on key fields
         duplicate_check = DuplicateCheckTask(
             name="duplicate_check",
             key_fields=["id", "timestamp"],
             action="remove"
         )
         
-        # 5. Data Quality Validation Task: Validates records against business rules
+        # 7. Data Quality Validation Task: Validates records against business rules
         quality_validation = DataQualityTask(
             name="quality_validation",
             rules=[
@@ -194,14 +249,14 @@ class DataPipeline:
             error_threshold=0.2  # Allow up to 20% errors
         )
         
-        # 6. MongoDB Sink Task: Writes processed records to MongoDB Atlas for persistence
+        # 8. MongoDB Sink Task: Writes processed records to MongoDB Atlas for persistence
         mongodb_sink = MongoDBSinkTask(
             name="mongodb_sink",
             batch_write=True,
             upsert_keys=None  # Insert only, no upsert
         )
         
-        # 7. Kafka Sink Task: Writes processed records to Kafka for downstream consumers
+        # 9. Kafka Sink Task: Writes processed records to Kafka for downstream consumers
         kafka_sink = KafkaSinkTask(
             name="kafka_sink",
             batch_write=True
@@ -209,7 +264,9 @@ class DataPipeline:
         
         # Add tasks to DAG
         dag.add_task(field_mapping)
+        dag.add_task(lookup_cache)
         dag.add_task(type_conversion)
+        dag.add_task(data_enrichment)
         dag.add_task(standardization)
         dag.add_task(duplicate_check)
         dag.add_task(quality_validation)
@@ -217,8 +274,10 @@ class DataPipeline:
         dag.add_task(kafka_sink)
         
         # Define task dependencies - creates execution order and parallel groups
-        dag.add_dependency("field_mapping", "type_conversion")
-        dag.add_dependency("type_conversion", "standardization")
+        dag.add_dependency("field_mapping", "lookup_cache")
+        dag.add_dependency("lookup_cache", "type_conversion") 
+        dag.add_dependency("type_conversion", "data_enrichment")
+        dag.add_dependency("data_enrichment", "standardization")
         dag.add_dependency("standardization", "duplicate_check")
         dag.add_dependency("duplicate_check", "quality_validation")
         # Both sinks run in parallel after quality validation
